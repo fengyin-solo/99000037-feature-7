@@ -39,6 +39,9 @@ export const authApi = {
 // Links API
 export const linksApi = {
   getLinks: (params) => api.get('/links', { params }),
+  getLink: (id) => api.get(`/links/${id}`),
+  checkUrl: (url, excludeId = null) =>
+    api.get('/links/check-url', { params: { url, exclude_id: excludeId || undefined } }),
   createLink: (data) => api.post('/links', data),
   updateLink: (id, data) => api.put(`/links/${id}`, data),
   deleteLink: (id) => api.delete(`/links/${id}`),

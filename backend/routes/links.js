@@ -1,11 +1,45 @@
 const express = require('express');
 const { getDb } = require('../db/init');
 const { authMiddleware } = require('../middleware/auth');
+const { sanitizeLinkPayload, isValidHttpUrl } = require('../utils/validation');
 
 const router = express.Router();
 
 // All routes require authentication
 router.use(authMiddleware);
+
+function sendValidationErrors(res, errors, status = 400, extra = {}) {
+  return res.status(status).json({ error: errors.join('；'), errors, ...extra });
+}
+
+// Attach the user's stored tags to a link row
+function withTags(db, link) {
+  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(link.id);
+  return { ...link, tags: linkTags.map((t) => t.tag) };
+}
+
+// Find another link (same user) with the same URL.
+// Comparison ignores leading/trailing whitespace because URLs are trimmed.
+function findDuplicateUrl(db, userId, url, excludeId = null) {
+  const sql = 'SELECT id, url, title FROM links WHERE user_id = ? AND url = ?'
+    + (excludeId !== null ? ' AND id != ?' : '');
+  const params = excludeId !== null ? [userId, url, excludeId] : [userId, url];
+  return db.prepare(sql).get(...params);
+}
+
+// GET /api/links/check-url?url=...&exclude_id=... - Duplicate URL pre-check
+router.get('/check-url', (req, res) => {
+  const userId = req.userId;
+  const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+
+  if (!isValidHttpUrl(url)) {
+    return sendValidationErrors(res, ['URL 只允许 http 或 https 协议，且必须是合法地址']);
+  }
+
+  const db = getDb();
+  const existing = findDuplicateUrl(db, userId, url, req.query.exclude_id || null);
+  res.json({ duplicate: !!existing, existing: existing || null });
+});
 
 // GET /api/links - List links with pagination, filtering, search
 router.get('/', (req, res) => {
@@ -71,32 +105,37 @@ router.get('/', (req, res) => {
 
 // POST /api/links - Create a new link
 router.post('/', (req, res) => {
-  const { url, title, description, category_id, tags, is_read_later, review_date } = req.body;
   const userId = req.userId;
+  const body = req.body || {};
+  const { category_id, is_read_later, review_date } = body;
 
-  if (!url || !title) {
-    return res.status(400).json({ error: 'URL and title are required' });
+  const { value, errors } = sanitizeLinkPayload(body);
+  if (errors.length > 0) {
+    return sendValidationErrors(res, errors);
   }
 
   const db = getDb();
 
+  // Duplicate URLs are rejected before saving; the client offers to
+  // edit the existing entry instead.
+  const existing = findDuplicateUrl(db, userId, value.url);
+  if (existing) {
+    return sendValidationErrors(res, ['该地址已存在，请直接编辑已有条目'], 409, { existing });
+  }
+
   const result = db.prepare(
     'INSERT INTO links (user_id, url, title, description, category_id, status, is_read_later, review_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(userId, url, title, description || '', category_id || null, 'unchecked', is_read_later ? 1 : 0, review_date || null);
+  ).run(userId, value.url, value.title, value.description, category_id || null, 'unchecked', is_read_later ? 1 : 0, review_date || null);
 
   const linkId = result.lastInsertRowid;
 
-  // Insert tags
-  if (tags && tags.length > 0) {
+  // Insert normalized tags (already trimmed and deduplicated)
+  if (value.tags.length > 0) {
     const insertTag = db.prepare('INSERT INTO link_tags (link_id, tag) VALUES (?, ?)');
     const insertTags = db.transaction((tagList) => {
-      tagList.forEach((tag) => {
-        if (tag.trim()) {
-          insertTag.run(linkId, tag.trim());
-        }
-      });
+      tagList.forEach((tag) => insertTag.run(linkId, tag));
     });
-    insertTags(tags);
+    insertTags(value.tags);
   }
 
   // Fetch the created link with all data
@@ -107,12 +146,7 @@ router.post('/', (req, res) => {
     WHERE l.id = ?
   `).get(linkId);
 
-  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(linkId);
-
-  res.json({
-    ...link,
-    tags: linkTags.map((t) => t.tag),
-  });
+  res.json(withTags(db, link));
 });
 
 // GET /api/links/read-later - Get read later list with filtering
@@ -296,10 +330,30 @@ router.put('/:id/review-status', (req, res) => {
   });
 });
 
+// GET /api/links/:id - Get a single link (used when switching to edit
+// an existing entry found via the duplicate URL check)
+router.get('/:id', (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+  const db = getDb();
+
+  const link = db.prepare(`
+    SELECT l.*, c.name as category_name, c.color as category_color
+    FROM links l
+    LEFT JOIN categories c ON l.category_id = c.id
+    WHERE l.id = ? AND l.user_id = ?
+  `).get(id, userId);
+  if (!link) {
+    return res.status(404).json({ error: 'Link not found' });
+  }
+
+  res.json(withTags(db, link));
+});
+
 // PUT /api/links/:id - Update a link
 router.put('/:id', (req, res) => {
   const { id } = req.params;
-  const { url, title, description, category_id, tags, is_read_later, review_date, review_status } = req.body;
+  const body = req.body || {};
   const userId = req.userId;
 
   const db = getDb();
@@ -310,36 +364,48 @@ router.put('/:id', (req, res) => {
     return res.status(404).json({ error: 'Link not found' });
   }
 
+  // Stored tags are merged in for validation of untouched fields
+  const storedTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(id).map((t) => t.tag);
+  const current = { ...link, tags: storedTags };
+
+  const { value, errors } = sanitizeLinkPayload(body, current);
+  if (errors.length > 0) {
+    return sendValidationErrors(res, errors);
+  }
+
+  const { category_id, is_read_later, review_date, review_status } = body;
+
+  // Reject if another entry of this user already uses the same URL
+  const existing = findDuplicateUrl(db, userId, value.url, id);
+  if (existing) {
+    return sendValidationErrors(res, ['该地址已被其他条目使用，请直接编辑已有条目'], 409, { existing });
+  }
+
   // Update link
   db.prepare(`
     UPDATE links
     SET url = ?, title = ?, description = ?, category_id = ?, is_read_later = ?, review_date = ?, review_status = ?
     WHERE id = ?
   `).run(
-    url || link.url, 
-    title || link.title, 
-    description ?? link.description, 
-    category_id ?? link.category_id,
+    value.url,
+    value.title,
+    value.description,
+    category_id !== undefined ? (category_id || null) : link.category_id,
     is_read_later !== undefined ? (is_read_later ? 1 : 0) : link.is_read_later,
     review_date !== undefined ? review_date : link.review_date,
     review_status || link.review_status,
     id
   );
 
-  // Update tags if provided
-  if (tags !== undefined) {
-    db.prepare('DELETE FROM link_tags WHERE link_id = ?').run(id);
-    if (tags && tags.length > 0) {
+  // Replace tags with the normalized set when tags were submitted;
+  // otherwise the stored tags were only used for re-validation
+  if (body.tags !== undefined) {
+    const replaceTags = db.transaction((tagList) => {
+      db.prepare('DELETE FROM link_tags WHERE link_id = ?').run(id);
       const insertTag = db.prepare('INSERT INTO link_tags (link_id, tag) VALUES (?, ?)');
-      const insertTags = db.transaction((tagList) => {
-        tagList.forEach((tag) => {
-          if (tag.trim()) {
-            insertTag.run(id, tag.trim());
-          }
-        });
-      });
-      insertTags(tags);
-    }
+      tagList.forEach((tag) => insertTag.run(id, tag));
+    });
+    replaceTags(value.tags);
   }
 
   // Fetch updated link
@@ -350,12 +416,7 @@ router.put('/:id', (req, res) => {
     WHERE l.id = ?
   `).get(id);
 
-  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(id);
-
-  res.json({
-    ...updatedLink,
-    tags: linkTags.map((t) => t.tag),
-  });
+  res.json(withTags(db, updatedLink));
 });
 
 // DELETE /api/links/:id - Delete a link

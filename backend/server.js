@@ -36,6 +36,9 @@ app.get('/api/ping', (req, res) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: '请求体不是合法的 JSON' });
+  }
   console.error(err.stack);
   res.status(500).json({ error: 'Something went wrong!' });
 });

@@ -56,6 +56,7 @@
       v-model:visible="formVisible"
       :link="editingLink"
       @saved="handleSaved"
+      @edit-existing="handleEdit"
     />
   </div>
 </template>
