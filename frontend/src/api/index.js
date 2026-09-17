@@ -42,6 +42,9 @@ export const linksApi = {
   createLink: (data) => api.post('/links', data),
   updateLink: (id, data) => api.put(`/links/${id}`, data),
   deleteLink: (id) => api.delete(`/links/${id}`),
+  // 保存前检查地址是否已收藏；重复时后端以 409 返回已有条目
+  checkUrlExists: (url, excludeId = null) =>
+    api.get('/links/exists', { params: excludeId ? { url, excludeId } : { url } }),
   getReadLater: (params) => api.get('/links/read-later', { params }),
   addToReadLater: (id, review_date) => api.post(`/links/${id}/read-later`, { review_date }),
   removeFromReadLater: (id) => api.delete(`/links/${id}/read-later`),

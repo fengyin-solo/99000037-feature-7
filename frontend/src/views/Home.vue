@@ -56,6 +56,7 @@
       v-model:visible="formVisible"
       :link="editingLink"
       @saved="handleSaved"
+      @edit-existing="handleEditExisting"
     />
   </div>
 </template>
@@ -114,6 +115,11 @@ async function handleDelete(link) {
 function handleSaved() {
   formVisible.value = false
   editingLink.value = null
+}
+
+// 地址重复时，弹窗保持打开，直接载入服务端返回的已有条目
+function handleEditExisting(existing) {
+  editingLink.value = { ...existing }
 }
 
 function handlePageChange(page) {

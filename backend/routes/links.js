@@ -1,11 +1,38 @@
 const express = require('express');
 const { getDb } = require('../db/init');
 const { authMiddleware } = require('../middleware/auth');
+const { validateLinkInput } = require('../utils/validation');
 
 const router = express.Router();
 
 // All routes require authentication
 router.use(authMiddleware);
+
+// 组装一条链接记录（含标签与分类信息），供各接口复用
+function serializeLink(db, id) {
+  const link = db.prepare(`
+    SELECT l.*, c.name as category_name, c.color as category_color
+    FROM links l
+    LEFT JOIN categories c ON l.category_id = c.id
+    WHERE l.id = ?
+  `).get(id);
+
+  if (!link) return null;
+
+  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(id);
+  return {
+    ...link,
+    tags: linkTags.map((t) => t.tag),
+  };
+}
+
+// 同一用户下地址不能重复；编辑时 excludeId 为当前链接 id
+function findDuplicateUrl(db, userId, url, excludeId = null) {
+  const row = db
+    .prepare('SELECT id FROM links WHERE user_id = ? AND url = ? AND id != ? LIMIT 1')
+    .get(userId, url, excludeId || 0);
+  return row ? row.id : null;
+}
 
 // GET /api/links - List links with pagination, filtering, search
 router.get('/', (req, res) => {
@@ -69,50 +96,72 @@ router.get('/', (req, res) => {
   });
 });
 
-// POST /api/links - Create a new link
-router.post('/', (req, res) => {
-  const { url, title, description, category_id, tags, is_read_later, review_date } = req.body;
+// GET /api/links/exists?url=...&excludeId=... - 保存前检查地址是否已收藏
+router.get('/exists', (req, res) => {
   const userId = req.userId;
+  const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
 
-  if (!url || !title) {
-    return res.status(400).json({ error: 'URL and title are required' });
+  if (!rawUrl) {
+    return res.status(400).json({ error: 'URL 不能为空' });
   }
 
+  const excludeId = Number(req.query.excludeId) || null;
+
+  const db = getDb();
+  const duplicateId = findDuplicateUrl(db, userId, rawUrl, excludeId);
+  if (!duplicateId) {
+    return res.json({ exists: false });
+  }
+
+  const link = serializeLink(db, duplicateId);
+  return res.status(409).json({
+    exists: true,
+    error: '该地址已收藏，请改为编辑已有条目',
+    code: 'DUPLICATE_URL',
+    link,
+  });
+});
+
+// POST /api/links - Create a new link
+router.post('/', (req, res) => {
+  const userId = req.userId;
   const db = getDb();
 
-  const result = db.prepare(
+  const { category_id, is_read_later, review_date } = req.body || {};
+
+  // 服务端强制校验：协议、长度、标签数量、重复标签等
+  const result = validateLinkInput(req.body);
+  if (result.error) {
+    return res.status(400).json({ error: result.error });
+  }
+  const { url, title, description, tags } = result.data;
+
+  // 地址重复时不允许创建，引导改为编辑已有条目
+  const duplicateId = findDuplicateUrl(db, userId, url);
+  if (duplicateId) {
+    return res.status(409).json({
+      error: '该地址已收藏，请改为编辑已有条目',
+      code: 'DUPLICATE_URL',
+      link: serializeLink(db, duplicateId),
+    });
+  }
+
+  const insertResult = db.prepare(
     'INSERT INTO links (user_id, url, title, description, category_id, status, is_read_later, review_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(userId, url, title, description || '', category_id || null, 'unchecked', is_read_later ? 1 : 0, review_date || null);
+  ).run(userId, url, title, description, category_id || null, 'unchecked', is_read_later ? 1 : 0, review_date || null);
 
-  const linkId = result.lastInsertRowid;
+  const linkId = insertResult.lastInsertRowid;
 
-  // Insert tags
-  if (tags && tags.length > 0) {
+  // Insert tags（校验已去重、限量，这里按结果直接写入）
+  if (tags.length > 0) {
     const insertTag = db.prepare('INSERT INTO link_tags (link_id, tag) VALUES (?, ?)');
     const insertTags = db.transaction((tagList) => {
-      tagList.forEach((tag) => {
-        if (tag.trim()) {
-          insertTag.run(linkId, tag.trim());
-        }
-      });
+      tagList.forEach((tag) => insertTag.run(linkId, tag));
     });
     insertTags(tags);
   }
 
-  // Fetch the created link with all data
-  const link = db.prepare(`
-    SELECT l.*, c.name as category_name, c.color as category_color
-    FROM links l
-    LEFT JOIN categories c ON l.category_id = c.id
-    WHERE l.id = ?
-  `).get(linkId);
-
-  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(linkId);
-
-  res.json({
-    ...link,
-    tags: linkTags.map((t) => t.tag),
-  });
+  res.status(201).json(serializeLink(db, linkId));
 });
 
 // GET /api/links/read-later - Get read later list with filtering
@@ -299,7 +348,8 @@ router.put('/:id/review-status', (req, res) => {
 // PUT /api/links/:id - Update a link
 router.put('/:id', (req, res) => {
   const { id } = req.params;
-  const { url, title, description, category_id, tags, is_read_later, review_date, review_status } = req.body;
+  const body = req.body || {};
+  const { category_id, is_read_later, review_date, review_status } = body;
   const userId = req.userId;
 
   const db = getDb();
@@ -310,52 +360,84 @@ router.put('/:id', (req, res) => {
     return res.status(404).json({ error: 'Link not found' });
   }
 
+  const tagsProvided = body.tags !== undefined && body.tags !== null;
+  const contentFieldsProvided =
+    body.url !== undefined ||
+    body.title !== undefined ||
+    body.description !== undefined ||
+    tagsProvided;
+
+  let url = link.url;
+  let title = link.title;
+  let description = link.description;
+  let tags;
+
+  // 只有提交了内容字段（完整表单一定会全部提交）才走强制校验。
+  // 与存量值合并后一起校验：已存在的超长/非法数据不能原样保存。
+  if (contentFieldsProvided) {
+    const existingTags = db
+      .prepare('SELECT tag FROM link_tags WHERE link_id = ?')
+      .all(id)
+      .map((t) => t.tag);
+
+    const candidate = {
+      url: body.url !== undefined ? body.url : link.url,
+      title: body.title !== undefined ? body.title : link.title,
+      description: body.description !== undefined ? body.description : link.description,
+      tags: tagsProvided ? body.tags : existingTags,
+    };
+
+    const result = validateLinkInput(candidate);
+    if (result.error) {
+      return res.status(400).json({ error: result.error });
+    }
+    url = result.data.url;
+    title = result.data.title;
+    description = result.data.description;
+    tags = result.data.tags;
+  }
+
+  // 地址重复（指向其他条目）时拒绝保存
+  if (body.url !== undefined) {
+    const duplicateId = findDuplicateUrl(db, userId, url, id);
+    if (duplicateId) {
+      return res.status(409).json({
+        error: '该地址已被其他条目使用，请改为编辑已有条目',
+        code: 'DUPLICATE_URL',
+        link: serializeLink(db, duplicateId),
+      });
+    }
+  }
+
   // Update link
   db.prepare(`
     UPDATE links
     SET url = ?, title = ?, description = ?, category_id = ?, is_read_later = ?, review_date = ?, review_status = ?
     WHERE id = ?
   `).run(
-    url || link.url, 
-    title || link.title, 
-    description ?? link.description, 
-    category_id ?? link.category_id,
+    url,
+    title,
+    description ?? '',
+    category_id !== undefined && category_id !== null ? category_id : link.category_id,
     is_read_later !== undefined ? (is_read_later ? 1 : 0) : link.is_read_later,
     review_date !== undefined ? review_date : link.review_date,
     review_status || link.review_status,
     id
   );
 
-  // Update tags if provided
-  if (tags !== undefined) {
+  // 仅在提交了 tags 时重写标签（校验已去重、限量）
+  if (contentFieldsProvided && tagsProvided) {
     db.prepare('DELETE FROM link_tags WHERE link_id = ?').run(id);
-    if (tags && tags.length > 0) {
+    if (tags.length > 0) {
       const insertTag = db.prepare('INSERT INTO link_tags (link_id, tag) VALUES (?, ?)');
       const insertTags = db.transaction((tagList) => {
-        tagList.forEach((tag) => {
-          if (tag.trim()) {
-            insertTag.run(id, tag.trim());
-          }
-        });
+        tagList.forEach((tag) => insertTag.run(id, tag));
       });
       insertTags(tags);
     }
   }
 
-  // Fetch updated link
-  const updatedLink = db.prepare(`
-    SELECT l.*, c.name as category_name, c.color as category_color
-    FROM links l
-    LEFT JOIN categories c ON l.category_id = c.id
-    WHERE l.id = ?
-  `).get(id);
-
-  const linkTags = db.prepare('SELECT tag FROM link_tags WHERE link_id = ?').all(id);
-
-  res.json({
-    ...updatedLink,
-    tags: linkTags.map((t) => t.tag),
-  });
+  res.json(serializeLink(db, id));
 });
 
 // DELETE /api/links/:id - Delete a link
